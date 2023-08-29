@@ -16,6 +16,8 @@ if TYPE_CHECKING:
                        PromptTuningConfig, get_peft_config, get_peft_model,
                        get_peft_model_state_dict)
     from .prompt import Prompt, PromptConfig, PromptModule
+    from .side import Side, SideConfig, SideModule
+    from .restuning import ResTuning, ResTuningConfig, ResTuningModule
     from .utils import SwiftConfig, SwiftOutput
 else:
     _import_structure = {
@@ -32,6 +34,8 @@ else:
             'get_peft_model_state_dict'
         ],
         'prompt': ['Prompt', 'PromptConfig', 'PromptModule'],
+        'side': ['Side', 'SideConfig', 'SideModule'],
+        'restuning': ['ResTuning', 'ResTuningConfig', 'ResTuningModule'],
         'utils': ['SwiftConfig', 'SwiftOutput'],
     }
 
