@@ -1,27 +1,17 @@
 import os
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 from types import MethodType
-from typing import Any, Dict, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 import torch
-from modelscope import (AutoConfig, AutoModelForCausalLM, AutoTokenizer, Model,
-                        read_config, snapshot_download)
-from modelscope.models.nlp.chatglm2 import ChatGLM2Config, ChatGLM2Tokenizer
-from modelscope.models.nlp.llama2 import Llama2Config, Llama2Tokenizer
+from modelscope import (AutoConfig, AutoModel, AutoModelForCausalLM,
+                        AutoTokenizer, Model, read_config, snapshot_download)
 from torch import dtype as Dtype
 
 from swift import get_logger
+from .utils import broadcast_string, is_dist, is_master
 
 logger = get_logger()
-
-
-def _add_special_token(tokenizer, special_token_mapper: Dict[str,
-                                                             Any]) -> None:
-    for k, v in special_token_mapper.items():
-        setattr(tokenizer, k, v)
-    assert tokenizer.eos_token is not None
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
 
 def get_model_tokenizer_from_repo(model_dir: str,
@@ -29,6 +19,7 @@ def get_model_tokenizer_from_repo(model_dir: str,
                                   load_model: bool = True,
                                   model_config=None,
                                   tokenizer=None,
+                                  automodel_class=AutoModelForCausalLM,
                                   **model_kwargs):
     """load from an independent repository"""
     if model_config is None:
@@ -41,7 +32,7 @@ def get_model_tokenizer_from_repo(model_dir: str,
             model_dir, trust_remote_code=True)
     model = None
     if load_model:
-        model = AutoModelForCausalLM.from_pretrained(
+        model = automodel_class.from_pretrained(
             model_dir,
             config=model_config,
             torch_dtype=torch_dtype,
@@ -84,8 +75,10 @@ def get_model_tokenizer_baichuan13b(model_dir: str,
     model, tokenizer = get_model_tokenizer_from_repo(model_dir, torch_dtype,
                                                      load_model,
                                                      **model_kwargs)
-    model.get_input_embeddings = MethodType(
-        lambda self: self.model.embed_tokens, model)
+
+    if not hasattr(model, 'get_input_embeddings'):
+        model.get_input_embeddings = MethodType(
+            lambda self: self.model.embed_tokens, model)
     return model, tokenizer
 
 
@@ -97,9 +90,12 @@ def get_model_tokenizer_chatglm2(model_dir: str,
         model_kwargs['quantization_config'].llm_int8_skip_modules = [
             'output_layer'
         ]
-    return get_model_tokenizer_from_sdk(ChatGLM2Config, ChatGLM2Tokenizer,
-                                        model_dir, torch_dtype, load_model,
-                                        **model_kwargs)
+    return get_model_tokenizer_from_repo(
+        model_dir,
+        torch_dtype,
+        load_model,
+        automodel_class=AutoModel,
+        **model_kwargs)
 
 
 def get_model_tokenizer_llama2(model_dir: str,
@@ -109,9 +105,8 @@ def get_model_tokenizer_llama2(model_dir: str,
     model_config = AutoConfig.from_pretrained(
         model_dir, trust_remote_code=True)
     model_config.pretraining_tp = 1
-    return get_model_tokenizer_from_sdk(Llama2Config, Llama2Tokenizer,
-                                        model_dir, torch_dtype, load_model,
-                                        model_config, **model_kwargs)
+    return get_model_tokenizer_from_repo(model_dir, torch_dtype, load_model,
+                                         model_config, **model_kwargs)
 
 
 def get_model_tokenizer_polylm(model_dir: str,
@@ -148,12 +143,28 @@ def get_model_tokenizer_qwen(model_dir: str,
 
     use_flash_attn = kwargs.pop('use_flash_attn', 'auto')
     model_config.use_flash_attn = use_flash_attn
-    return get_model_tokenizer_from_repo(model_dir, torch_dtype, load_model,
-                                         model_config, **kwargs)
+    model, tokenizer = get_model_tokenizer_from_repo(model_dir, torch_dtype,
+                                                     load_model, model_config,
+                                                     **kwargs)
+    tokenizer.eos_token_id = tokenizer.eod_id
+    return model, tokenizer
+
+
+def get_model_tokenizer_qwen_vl(model_dir: str,
+                                torch_dtype: Dtype,
+                                load_model: bool = True,
+                                **kwargs):
+    if 'quantization_config' in kwargs:
+        # https://github.com/pytorch/pytorch/issues/58969
+        kwargs['quantization_config'].llm_int8_skip_modules = [
+            'lm_head', 'attn_pool.attn'
+        ]
+    return get_model_tokenizer_qwen(model_dir, torch_dtype, load_model,
+                                    **kwargs)
 
 
 class LoRATM(NamedTuple):
-    # default lora target modules
+    # default lora target modules. qkv
     baichuan = ['W_pack']
     chatglm2 = ['query_key_value']
     llama2 = ['q_proj', 'k_proj', 'v_proj']
@@ -162,64 +173,124 @@ class LoRATM(NamedTuple):
 
 
 # Model Home: 'https://modelscope.cn/models/{model_id}/summary'
-# keys: 'model_id', 'revision', 'get_function',
-#   'ignore_file_pattern', 'special_token_mapper', 'lora_TM'
+# keys: 'model_id', 'revision', 'get_function', 'template',
+#   'ignore_file_pattern', 'lora_TM'
 MODEL_MAPPING = {
     'qwen-7b': {
-        'model_id': 'qwen/Qwen-7B',
-        'revision': 'v.1.0.4',
+        'model_id': 'qwen/Qwen-7B',  # model id or model dir
+        'revision': 'v1.0.5',
         'get_function': get_model_tokenizer_qwen,
+        'template': 'chatml',
         'lora_TM': LoRATM.qwen,
-        'special_token_mapper': {
-            'eos_token': '<|endoftext|>'
-        }
+    },
+    'qwen-7b-chat': {
+        'model_id': 'qwen/Qwen-7B-Chat',
+        'revision': 'v1.0.6',
+        'get_function': get_model_tokenizer_qwen,
+        'template': 'chatml',
+        'lora_TM': LoRATM.qwen,
+    },
+    'qwen-vl': {
+        'model_id': 'qwen/Qwen-VL',
+        'revision': 'v1.0.2',
+        'get_function': get_model_tokenizer_qwen_vl,
+        'template': 'chatml',
+        'lora_TM': LoRATM.qwen,
+    },
+    'qwen-vl-chat': {
+        'model_id': 'qwen/Qwen-VL-Chat',
+        'revision': 'v1.0.2',
+        'get_function': get_model_tokenizer_qwen_vl,
+        'template': 'chatml',
+        'lora_TM': LoRATM.qwen,
     },
     'baichuan-7b': {
-        'model_id': 'baichuan-inc/baichuan-7B',  # model id or model dir
+        'model_id': 'baichuan-inc/baichuan-7B',
         'revision': 'v1.0.7',
-        'lora_TM': LoRATM.baichuan
+        'template': 'baichuan',
+        'lora_TM': LoRATM.baichuan,
     },
     'baichuan-13b': {
         'model_id': 'baichuan-inc/Baichuan-13B-Base',
         'revision': 'v1.0.5',
         'get_function': get_model_tokenizer_baichuan13b,
-        'lora_TM': LoRATM.baichuan
+        'template': 'baichuan',
+        'lora_TM': LoRATM.baichuan,
+    },
+    'baichuan-13b-chat': {
+        'model_id': 'baichuan-inc/Baichuan-13B-Chat',
+        'revision': 'v1.0.8',
+        'template': 'baichuan',
+        'lora_TM': LoRATM.baichuan,
     },
     'chatglm2-6b': {
         'model_id': 'ZhipuAI/chatglm2-6b',
-        'revision': 'v1.0.7',
+        'revision': 'v1.0.8',
         'get_function': get_model_tokenizer_chatglm2,
-        'lora_TM': LoRATM.chatglm2
+        'template': 'chatglm2',
+        'lora_TM': LoRATM.chatglm2,
+    },
+    'chatglm2-6b-32k': {
+        'model_id': 'ZhipuAI/chatglm2-6b-32k',
+        'revision': 'v1.0.0',
+        'template': 'chatglm2',
+        'lora_TM': LoRATM.chatglm2,
     },
     'llama2-7b': {
         'model_id': 'modelscope/Llama-2-7b-ms',
         'revision': 'v1.0.2',
-        'get_function': get_model_tokenizer_llama2,
+        'template': 'llama',
         'ignore_file_pattern': [r'.+\.bin$'],  # use safetensors
-        'lora_TM': LoRATM.llama2
+        'lora_TM': LoRATM.llama2,
     },
     'llama2-13b': {
         'model_id': 'modelscope/Llama-2-13b-ms',
         'revision': 'v1.0.2',
         'get_function': get_model_tokenizer_llama2,
+        'template': 'llama',
         'ignore_file_pattern': [r'.+\.bin$'],
-        'lora_TM': LoRATM.llama2
+        'lora_TM': LoRATM.llama2,
     },
     'llama2-70b': {
         'model_id': 'modelscope/Llama-2-70b-ms',
         'revision': 'v1.0.0',
-        'get_function': get_model_tokenizer_llama2,
+        'template': 'llama',
         'ignore_file_pattern': [r'.+\.bin$'],
-        'lora_TM': LoRATM.llama2
+        'lora_TM': LoRATM.llama2,
+    },
+    'llama2-7b-chat': {
+        'model_id': 'modelscope/Llama-2-7b-chat-ms',
+        'revision': 'v1.0.2',
+        'template': 'llama',
+        'ignore_file_pattern': [r'.+\.bin$'],  # use safetensors
+        'lora_TM': LoRATM.llama2,
+    },
+    'llama2-13b-chat': {
+        'model_id': 'modelscope/Llama-2-13b-chat-ms',
+        'revision': 'v1.0.2',
+        'get_function': get_model_tokenizer_llama2,
+        'template': 'llama',
+        'ignore_file_pattern': [r'.+\.bin$'],
+        'lora_TM': LoRATM.llama2,
+    },
+    'llama2-70b-chat': {
+        'model_id': 'modelscope/Llama-2-70b-chat-ms',
+        'revision': 'v1.0.1',
+        'get_function': get_model_tokenizer_llama2,
+        'template': 'llama',
+        'ignore_file_pattern': [r'.+\.bin$'],
+        'lora_TM': LoRATM.llama2,
     },
     'openbuddy-llama2-13b': {
         'model_id': 'OpenBuddy/openbuddy-llama2-13b-v8.1-fp16',
         'revision': 'v1.0.0',
+        'template': 'openbuddy_llama',
         'lora_TM': LoRATM.llama2,
     },
     'openbuddy-llama-65b': {
         'model_id': 'OpenBuddy/openbuddy-llama-65b-v8-bf16',
         'revision': 'v1.0.0',
+        'template': 'openbuddy_llama',
         'lora_TM': LoRATM.llama2,
     },
     'polylm-13b': {
@@ -242,7 +313,6 @@ def get_model_tokenizer(model_type: str,
     model_id = data['model_id']
     get_function = data.get('get_function', get_model_tokenizer_from_repo)
     ignore_file_pattern = data.get('ignore_file_pattern', [])
-    special_token_mapper = data.get('special_token_mapper', {})
     if torch_dtype is None:
         torch_dtype = data.get('torch_dtype', torch.float16)
     if 'device_map' not in kwargs:
@@ -250,13 +320,20 @@ def get_model_tokenizer(model_type: str,
 
     model_dir = kwargs.pop('model_dir', None)
     if model_dir is None:
-        model_dir = model_id
-        if not os.path.exists(model_id):
-            revision = data.get('revision', 'master')
-            model_dir = snapshot_download(
-                model_id, revision, ignore_file_pattern=ignore_file_pattern)
+        if is_master():
+            model_dir = model_id
+            if not os.path.exists(model_id):
+                revision = data.get('revision', 'master')
+                model_dir = snapshot_download(
+                    model_id,
+                    revision,
+                    ignore_file_pattern=ignore_file_pattern)
+        if is_dist():
+            model_dir = broadcast_string(model_dir)
 
     model, tokenizer = get_function(model_dir, torch_dtype, load_model,
                                     **kwargs)
-    _add_special_token(tokenizer, special_token_mapper)
+    assert tokenizer.eos_token is not None
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     return model, tokenizer

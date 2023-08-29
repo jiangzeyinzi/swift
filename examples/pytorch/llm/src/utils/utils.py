@@ -1,28 +1,30 @@
+import logging
 import os
+import shutil
+from tempfile import TemporaryDirectory
 from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+import requests
 import torch
 import torch.distributed as dist
+from modelscope.utils.config_ds import MS_CACHE_HOME
+from modelscope.utils.logger import get_logger as get_ms_logger
 from torch import dtype as Dtype
-from torch.nn import Module
-from transformers import GenerationConfig, TextStreamer
+from torch.nn import Linear, Module
+from tqdm.auto import tqdm
+from transformers import GenerationConfig, TextStreamer, trainer
 
 from swift import get_logger
+from swift.hub import ModelScopeConfig
 from swift.utils.tb_utils import (TB_COLOR, TB_COLOR_SMOOTH,
                                   read_tensorboard_file, tensorboard_smoothing)
+from .trainer_patch import DefaultFlowCallbackNew, ProgressCallbackNew
+
+logger = get_logger()
+ms_logger = get_ms_logger()
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
-logger = get_logger()
-
-DEFAULT_PROMPT = """Here's a conversation between a human and an AI assistant. \
-The AI assistant provides detailed, friendly answers for the human.
-
-### Human:
-{instruction}
-
-### AI:
-"""
 
 DTYPE_MAPPING = {
     'fp16': torch.float16,
@@ -40,9 +42,15 @@ def get_dist_setting() -> Tuple[int, int, int, int]:
     return rank, local_rank, world_size, local_world_size
 
 
+def is_master():
+    rank = get_dist_setting()[0]
+    return rank in {-1, 0}
+
+
 def is_dist():
-    rank = int(os.getenv('RANK', -1))
-    return rank >= 0
+    """Determine if the training is distributed"""
+    rank, local_rank, _, _ = get_dist_setting()
+    return rank >= 0 and local_rank >= 0
 
 
 def show_layers(model: Module, max_lines: Optional[int] = 20) -> None:
@@ -62,6 +70,7 @@ def plot_images(images_dir: str,
                 smooth_val: float = 0.9,
                 figsize: Tuple[int, int] = (8, 5),
                 dpi: int = 100) -> None:
+    """Using tensorboard's data content to plot images"""
     os.makedirs(images_dir, exist_ok=True)
     fname = [
         fname for fname in os.listdir(tb_dir)
@@ -95,8 +104,9 @@ def inference(input_ids: List[int],
               tokenizer,
               streamer: Optional[TextStreamer] = None,
               generation_config: Optional[GenerationConfig] = None,
-              tag: str = '[INFERENCE]') -> str:
-    print(f'{tag}{tokenizer.decode(input_ids)}', end='')
+              skip_prompt: bool = True) -> str:
+    if not skip_prompt:
+        print(f'[INFERENCE]{tokenizer.decode(input_ids)}', end='')
     input_ids = torch.tensor(input_ids)[None].cuda()
     attention_mask = torch.ones_like(input_ids)
     model.eval()
@@ -145,7 +155,7 @@ def select_bnb(quantization_bit: Optional[int],
 
 
 def broadcast_string(string: Optional[str], buffer_size: int = 100) -> str:
-    """
+    """String broadcasting in case of DDP
     string: main rank: str
         other rank: None
     return: all rank: str
@@ -165,3 +175,75 @@ def broadcast_string(string: Optional[str], buffer_size: int = 100) -> str:
     first_zero = (tensor == 0).nonzero()[0].item()
     res = tensor.tolist()[:first_zero]
     return ''.join([chr(x) for x in res])
+
+
+def find_all_linear_for_lora(model: Module,
+                             quantization_bit: Optional[int],
+                             model_type: Optional[str] = None) -> List[str]:
+    """ref: https://github.com/artidoro/qlora"""
+    head_module_name = 'lm_head'
+    if model_type.startswith('chatglm2-6b'):
+        head_module_name = 'output_layer'
+    if model_type.startswith('qwen-vl'):
+        return ['c_attn', 'attn.c_proj', 'w1', 'w2']
+    if quantization_bit == 4:
+        from bitsandbytes.nn import Linear4bit
+        linear_cls = Linear4bit
+    elif quantization_bit == 8:
+        from bitsandbytes.nn import Linear8bitLt
+        linear_cls = Linear8bitLt
+    else:
+        linear_cls = Linear
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if isinstance(module, linear_cls):
+            module_name = name.split('.')[-1]
+            if head_module_name not in module_name:
+                lora_module_names.add(module_name)
+    return list(lora_module_names)
+
+
+def download_dataset(model_id: str,
+                     files: List[str],
+                     force_download: bool = False) -> str:
+    url = f'http://www.modelscope.cn/api/v1/datasets/{model_id}/repo?Revision=master&FilePath={{fpath}}'
+    cache_dir = os.path.join(MS_CACHE_HOME, 'datasets', model_id, 'master')
+    local_dir = os.path.join(cache_dir, 'raw')
+    tmp_dir = os.path.join(cache_dir, 'tmp')
+    os.makedirs(local_dir, exist_ok=True)
+    os.makedirs(tmp_dir, exist_ok=True)
+    cookies = ModelScopeConfig.get_cookies()
+    with TemporaryDirectory(dir=tmp_dir) as temp_dir:
+        for remote_fpath in files:
+            url = url.format(fpath=remote_fpath)
+            temp_fpath = os.path.join(temp_dir, remote_fpath)
+            local_fpath = os.path.join(local_dir, remote_fpath)
+            if not force_download and os.path.exists(local_fpath):
+                continue
+            download_files(url, temp_fpath, cookies)
+            shutil.copy2(temp_fpath, local_fpath)
+
+    return local_dir
+
+
+def download_files(url: str, local_path: str, cookies) -> None:
+    resp = requests.get(url, cookies=cookies, stream=True)
+    with open(local_path, 'wb') as f:
+        for data in tqdm(resp.iter_lines()):
+            f.write(data)
+
+
+logger_format = logging.Formatter('[%(levelname)s:%(name)s] %(message)s')
+
+logger.handlers[0].setFormatter(logger_format)
+ms_logger.handlers[0].setFormatter(logger_format)
+if is_master():
+    logger.setLevel(logging.INFO)
+    ms_logger.setLevel(logging.INFO)
+else:
+    logger.setLevel(logging.ERROR)
+    ms_logger.setLevel(logging.ERROR)
+
+# monkey patch
+trainer.DEFAULT_PROGRESS_CALLBACK = ProgressCallbackNew
+trainer.DEFAULT_CALLBACKS = [DefaultFlowCallbackNew]
