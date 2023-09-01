@@ -75,7 +75,7 @@ class ResAdapter(nn.Module):
             dim = self.adapter_length[2]
 
         self._xavier_init_weights(self.ln1)
-        if zero_init_last and layer_num == depth - 1 and stage == "lateral":
+        if zero_init_last and layer_num == depth - 1:
             self._zero_init_weights(self.ln2)
         else:
             self._xavier_init_weights(self.ln2)
@@ -137,7 +137,7 @@ class ResGroupAdapter(nn.Module):
         self.activate = act_layer()
 
         self._kaiming_init_weights(self.ln1)
-        if zero_init_last and layer_num == depth - 1 and stage == "lateral":
+        if zero_init_last and layer_num == depth - 1:
             self._zero_init_weights(self.ln2)
         else:
             self._kaiming_init_weights(self.ln2)

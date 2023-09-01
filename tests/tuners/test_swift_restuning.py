@@ -97,6 +97,15 @@ class TestSwiftResTuning(unittest.TestCase):
         model.requires_grad_(False)
         model2 = copy.deepcopy(model)
         self.set_random_seed()
+        input_data = {
+            "sample": torch.ones((1, 4, 64, 64)),
+            "timestep": 10,
+            "encoder_hidden_states": torch.ones((1, 77, 768))
+        }
+        result_origin = model(**input_data).sample
+        print(f"test_swift_restuning_diffusers_sd result_origin shape: {result_origin.shape}, result_origin sum: {torch.sum(result_origin)}")
+
+        self.set_random_seed()
         restuning_config = ResTuningConfig(
             dims=[1280, 1280, 1280, 640, 320],
             root_modules='mid_block',
@@ -111,11 +120,7 @@ class TestSwiftResTuning(unittest.TestCase):
         model = Swift.prepare_model(model, config=restuning_config)
         self.assertTrue(isinstance(model, SwiftModel))
         print(model.get_trainable_parameters())
-        input_data = {
-            "sample": torch.ones((1, 4, 64, 64)),
-            "timestep": 10,
-            "encoder_hidden_states": torch.ones((1, 77, 768))
-        }
+        
         result = model(**input_data).sample
         print(f"test_swift_restuning_diffusers_sd result shape: {result.shape}, result sum: {torch.sum(result)}")
         model.save_pretrained(self.tmp_dir)

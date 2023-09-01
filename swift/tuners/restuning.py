@@ -191,9 +191,6 @@ class ResTuning:
                     stem_module.register_forward_pre_hook(probe_input_pre_hook, with_kwargs=True)
                 else:
                     stem_module.register_forward_hook(probe_output_hook, with_kwargs=True)
-                if isinstance(stem_module, nn.Sequential):
-                    stem_module.origin_module_keys = copy.deepcopy(list(stem_module._modules.keys()))
-                    stem_module.forward = types.MethodType(_forward_seq, stem_module)
                 stem_module.stem_modules_hook = config.stem_modules_hook 
                 stem_module_ins_list.append(stem_module)
         if isinstance(config.stem_modules, list):

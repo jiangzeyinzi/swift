@@ -115,8 +115,6 @@ class LoRA:
         modules = []
         module_keys = [key for key, _ in model.named_modules()]
         assert isinstance(replace_modules, (str, list))
-        if isinstance(replace_modules, str):
-            replace_modules = [replace_modules]
 
         for module_key in module_keys:
             if isinstance(replace_modules, str):
